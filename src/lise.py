@@ -25,40 +25,37 @@ import certifi
 from kivy.logger import Logger
 import json
 import rsa
+from appdirs import *
+from pathlib import Path
+import os
 
 from base64 import b64decode
 
-SERVER_URL = "<INSERT HERE>"
+class Service:
+    
+    def __init__(self, org: str, product: str, product_id: int, pub_key: str, URL: str):
+        self.pub_key = pub_key
+        self.URL = URL
+        self.org = org
+        self.product = product
+        self.product_id = product_id
 
 class LicenceUsage:
 
-    def __init__(self, RSA):
-        self.licence = False
-        self.RSA = RSA
-
-    @classmethod
-    def load(cls, RSA, key):
-        try:
-            newkey: LicenceUsage = LicenceUsage(RSA)
-            token = key.get("token")
-            signature = key.get("signature")
-            rsa.verify(token.encode(), b64decode(signature.encode()),
-                       rsa.PublicKey.load_pkcs1(RSA))
-            newkey.token = json.loads(token)
-            newkey.key = key
-            newkey.licence = True
-            return newkey
-        except rsa.VerificationError:
-            return None
-        except:
-            Logger.error("LiSe Validate error: No Key defined")
-            return None
-
-    def validate(self, success_callback):
-        if self.key:
+    def __init__(self, service: Service):
+        self.loaded: bool = False
+        self.valid: bool = False
+        self.service: Service = service
+        
+    def validate(self, success_callback, failure_callback):
+        if self.loaded:
             self.success_callback = success_callback
-            url = SERVER_URL + "validate_key"
-            payload = json.dumps(self.key)
+            self.failure_callback = failure_callback
+            url = self.service.URL + "validate_key"
+            payload = json.dumps({
+                "signature": self.signature,
+                "token": self.token
+            })
             headers = {'Content-type': 'application/json'}
             UrlRequest(
                 url,
@@ -75,37 +72,74 @@ class LicenceUsage:
 
     def validate_sucess(self, urlrequest, data):
         try:
-            self.licence = True
-            self.token = json.loads(data.get('token'))
-            self.key = data
+            self.valid = True
+            self.signature = data.get('signature')
+            self.token = data.get('token')
             self.success_callback(self)
         except Exception as e:
             Logger.error(str(e))
 
     def validate_failure(self, urlrequest, data):
         Logger.error(str(data))
+        self.valid = False
+        self.failure_callback(self)
 
-    @classmethod
-    def create_key(cls, RSA, success_callback, **kwargs):
-        newkey: LicenceUsage = LicenceUsage(RSA)
-        newkey.success_callback = success_callback
-        url = SERVER_URL + "get_key"
+    def create_key(self, success_callback, failure_callback,  **kwargs):
+        self.success_callback = success_callback
+        self.failure_callback = failure_callback
+        url = self.service.URL + "get_key"
         payload = json.dumps({
             "instance_code": kwargs.get("instance_code"),
             "instance_type": kwargs.get("instance_type"),
             "auth_code": kwargs.get("auth_code"),
             "auth_type": kwargs.get("auth_type"),
-            "product_id": kwargs.get("product_id")
+            "product_id": self.service.product_id
         })
         headers = {'Content-type': 'application/json'}
         UrlRequest(
             url,
             req_body=payload,
-            on_success=newkey.validate_sucess,
-            on_failure=newkey.validate_failure,
-            on_error=newkey.validate_failure,
+            on_success=self.validate_sucess,
+            on_failure=self.validate_failure,
+            on_error=self.validate_failure,
             ca_file=certifi.where(),
             debug=True,
             req_headers=headers
         ).wait()
-        return newkey
+        return
+    
+    def get(self, auth_code: str):
+        if not os.path.exists(Path(user_data_dir(self.service.product, self.service.org))):
+            os.makedirs(Path(user_data_dir(self.service.product, self.service.org)))        
+        file: Path = Path(user_data_dir(self.service.product, self.service.org)).joinpath(auth_code)
+        if os.path.exists(file):
+            with open(file, "r") as f:
+                try:
+                    details = json.load(f)
+                except Exception as e:
+                    Logger.error(str(e))
+                    self.loaded = False
+                    return
+                Logger.info("opened file : " + str(file))
+                self.token = details.get('token')
+                self.signature = details.get('signature')
+                rsa.verify(self.token.encode(), b64decode(self.signature.encode()),
+                           rsa.PublicKey.load_pkcs1(self.service.pub_key))
+                if self.service.product_id == self.product:
+                    self.loaded = True
+                
+    def put(self, auth_code: str):
+        file: Path = Path(user_data_dir(self.service.product, self.service.org)).joinpath(auth_code)
+        with open(file, "w") as f:
+            json.dump({
+                "signature": self.signature,
+                "token": self.token
+                }, f)
+    
+    @property        
+    def licence(self) -> str:
+        return str(json.loads(self.token).get('licence_key', '') or '')
+    
+    @property
+    def product(self) -> int:
+        return json.loads(self.token).get('product_id', '') or ''
